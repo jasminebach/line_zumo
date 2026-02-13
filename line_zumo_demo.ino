@@ -1,139 +1,129 @@
-//
-// begin license header
-//
-// This file is part of Pixy CMUcam5 or "Pixy" for short
-//
-// All Pixy source code is provided under the terms of the
-// GNU General Public License v2 (http://www.gnu.org/licenses/gpl-2.0.html).
-// Those wishing to use Pixy source code, software and/or
-// technologies under different licensing terms should contact us at
-// cmucam@cs.cmu.edu. Such licensing terms are available for
-// all portions of the Pixy codebase presented here.
-//
-// end license header
-//
-
 #include <Pixy2.h>
 #include <PIDLoop.h>
 #include <ZumoMotors.h>
-#include <ZumoBuzzer.h>
 
-// Zumo speeds, maximum allowed is 400
-#define ZUMO_FAST        390
-#define ZUMO_SLOW        300
-#define X_CENTER         (pixy.frameWidth/2)
+#define ZUMO_FAST   390
+#define ZUMO_SLOW   290
+#define TURN_SPIN   400
+#define SEARCH_SPIN 220
+#define X_CENTER    (pixy.frameWidth/2)
 
 Pixy2 pixy;
 ZumoMotors motors;
-ZumoBuzzer buzzer;
+PIDLoop headingLoop(7500, 0, 4000, false);
 
-PIDLoop headingLoop(7500, 100, 11000, false); //7500 0 11000
+enum State { FOLLOW, TURN_RIGHT };
+State state = FOLLOW;
 
-void setup() 
+uint32_t lastJunctionMs = 0;
+uint32_t turnStartMs = 0;
+
+const uint32_t COOLDOWN_MS = 1000;
+const uint32_t TURN_TIMEOUT_MS = 900;
+
+int32_t lastError = 0;
+bool hasLastError = false;
+
+static inline void swap16(int16_t &a, int16_t &b){ int16_t t=a; a=b; b=t; }
+
+static inline int16_t farXNormalized()
 {
-  Serial.begin(115200);
-  Serial.print("Starting...\n");
+  int16_t x0=pixy.line.vectors->m_x0, y0=pixy.line.vectors->m_y0;
+  int16_t x1=pixy.line.vectors->m_x1, y1=pixy.line.vectors->m_y1;
+  if (y0 < y1) { swap16(x0,x1); swap16(y0,y1); }
+  return x1;
+}
+
+static inline void setSpeeds(int16_t l, int16_t r)
+{
+  if (l > 400) l = 400; if (l < -400) l = -400;
+  if (r > 400) r = 400; if (r < -400) r = -400;
+  motors.setLeftSpeed(l);
+  motors.setRightSpeed(r);
+}
+
+static inline void searchSpin()
+{
+  // if we remember the line was left, spin left; else spin right
+  if (hasLastError && lastError < 0) setSpeeds(-TURN_SPIN, TURN_SPIN);
+  else setSpeeds(SEARCH_SPIN, -SEARCH_SPIN);
+}
+
+void setup()
+{
   motors.setLeftSpeed(0);
   motors.setRightSpeed(0);
 
   pixy.init();
-  // Turn on both lamps, upper and lower for maximum exposure
   pixy.setLamp(1, 1);
-  // change to the line_tracking program.  Note, changeProg can use partial strings, so for example,
-  // you can change to the line_tracking program by calling changeProg("line") instead of the whole
-  // string changeProg("line_tracking")
   pixy.changeProg("line");
-
-  // look straight and down
   pixy.setServos(455, 1000);
 }
 
-
 void loop()
 {
-  int8_t res;
-  int32_t error; 
-  int left, right;
-  char buf[96];
+  int8_t res = pixy.line.getMainFeatures();
+  uint32_t now = millis();
 
-  // Get latest data from Pixy, including main vector, new intersections and new barcodes.
-  res = pixy.line.getMainFeatures();
+  // Nothing detected -> don't drive forward, just search
+  if (res <= 0) { searchSpin(); return; }
 
-  // If error or nothing detected, stop motors
-  if (res<=0) 
+  // --- Forced right turn state (T junction) ---
+  if (state == TURN_RIGHT)
   {
-    motors.setLeftSpeed(0);
-    motors.setRightSpeed(0);
-    buzzer.playFrequency(500, 50, 15);
-    Serial.print("stop ");
-    Serial.println(res);
+    setSpeeds(TURN_SPIN, -TURN_SPIN);
+
+    if (res & LINE_VECTOR)
+    {
+      int32_t err = (int32_t)farXNormalized() - (int32_t)X_CENTER;
+      lastError = err; hasLastError = true;
+
+      // reacquire and exit once roughly centered
+      if (abs((int)err) < 20)
+      {
+        state = FOLLOW;
+        lastJunctionMs = now;
+        return;
+      }
+    }
+
+    // timeout: stop forcing, resume normal behavior
+    if (now - turnStartMs > TURN_TIMEOUT_MS)
+      state = FOLLOW;
+
     return;
   }
 
-  // We found the vector...
-  if (res&LINE_VECTOR)
+  // --- Junction detection (only trigger on T: branches >= 3) ---
+  if ((res & LINE_INTERSECTION) && (now - lastJunctionMs > COOLDOWN_MS))
   {
-    // Calculate heading error with respect to m_x1, which is the far-end of the vector,
-    // the part of the vector we're heading toward.
-    error = (int32_t)pixy.line.vectors->m_x1 - (int32_t)X_CENTER;
-
-    pixy.line.vectors->print();
-
-    // Perform PID calcs on heading error.
-    headingLoop.update(error);
-
-    // separate heading into left and right wheel velocities.
-    left = headingLoop.m_command;
-    right = -headingLoop.m_command;
-
-    // If vector is heading away from us (arrow pointing up), things are normal.
-    if (pixy.line.vectors->m_y0 > pixy.line.vectors->m_y1)
+    int branches = pixy.line.intersections->m_n;
+    if (branches >= 3)
     {
-      // ... but slow down a little if intersection is present, so we don't miss it.
-      if (pixy.line.vectors->m_flags&LINE_FLAG_INTERSECTION_PRESENT)
-      {
-        left += ZUMO_SLOW;
-        right += ZUMO_SLOW;
-      }
-      else // otherwise, pedal to the metal!
-      {
-        left += ZUMO_FAST;
-        right += ZUMO_FAST;
-      }    
+      state = TURN_RIGHT;
+      turnStartMs = now;
+      return;
     }
-    else  // If the vector is pointing down, or down-ish, we need to go backwards to follow.
-    {
-      left -= ZUMO_SLOW;
-      right -= ZUMO_SLOW;  
-    } 
-    motors.setLeftSpeed(left);
-    motors.setRightSpeed(right);
   }
 
-  // If intersection, do nothing (we've already set the turn), but acknowledge with a beep.
-  if (res&LINE_INTERSECTION)
+  // --- Normal PID follow ---
+  if (res & LINE_VECTOR)
   {
-    buzzer.playFrequency(1000, 100, 15);
-    pixy.line.intersections->print();
-  }
+    int32_t err = (int32_t)farXNormalized() - (int32_t)X_CENTER;
+    lastError = err; hasLastError = true;
 
-  // If barcode, acknowledge with beep, and set left or right turn accordingly. 
-  // When calling setNextTurn(), Pixy will "execute" the turn upon the next intersection, 
-  // making the left or right branch in the intersection the new main vector, depending on 
-  // the angle passed to setNextTurn(). The robot will then follow the branch.  
-  // If the turn is not set, Pixy will choose the straight(est) path by default, but 
-  // the default turn can be changed too by calling setDefaultTurn(). The default turn
-  // is normally 0 (straight).   
-  if (res&LINE_BARCODE)
+    headingLoop.update(err);
+
+    int base = (pixy.line.vectors->m_flags & LINE_FLAG_INTERSECTION_PRESENT) ? ZUMO_SLOW : ZUMO_FAST;
+    int16_t l = base + headingLoop.m_command;
+    int16_t r = base - headingLoop.m_command;
+
+    setSpeeds(l, r);
+  }
+  else
   {
-    buzzer.playFrequency(2000, 100, 15);
-    pixy.line.barcodes->print();
-    // code==0 is our left-turn sign
-    if (pixy.line.barcodes->m_code==0)
-      pixy.line.setNextTurn(90); // 90 degrees is a left turn 
-    // code==5 is our right-turn sign
-    else if (pixy.line.barcodes->m_code==5)
-      pixy.line.setNextTurn(-90); // -90 is a right turn 
+    // no vector but "something" detected -> search instead of moving forward
+    searchSpin();
   }
 }
 
